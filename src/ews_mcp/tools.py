@@ -207,9 +207,11 @@ def build_server(
         """Search one folder of the COMPANY work mailbox (Exchange); return headers, newest first.
 
         Reading the Inbox shows what came in; reading "sent" shows what the person replied.
-        Filters combine with AND. `text` searches subject and body. `sender` and `recipient` match
-        a name or address fragment. `since`/`until` are ISO dates (YYYY-MM-DD, inclusive). `limit`
-        is at most 50; use `offset` to page. Headers only: call `get_message` for a body.
+        Filters combine with AND. Date, unread, attachment and subject filters are exact.
+        `text` (subject and body), `sender` and `recipient` (name or address fragment) use the
+        server's search index, which can be incomplete; the result then carries a `note`.
+        `since`/`until` are ISO dates (YYYY-MM-DD, inclusive). `limit` is at most 50; use `offset`
+        to page. Headers only: call `get_message` for a body.
         Search does not change read/unread state.
         """
         if limit < 1 or limit > MAX_PAGE_SIZE:
@@ -230,6 +232,7 @@ def build_server(
             "offset": page.offset,
             "limit": page.limit,
             "has_more": page.has_more,
+            **({"note": page.note} if page.note else {}),
             "messages": [_summary(m) for m in page.items],
         }
 

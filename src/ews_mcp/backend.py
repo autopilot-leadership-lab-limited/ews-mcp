@@ -113,6 +113,7 @@ class Page:
     offset: int = 0
     limit: int = 0
     has_more: bool = False
+    note: str | None = None
 
 
 MAX_PAGE_SIZE = 50

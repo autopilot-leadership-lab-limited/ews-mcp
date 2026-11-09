@@ -14,7 +14,16 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
 
-from exchangelib import DELEGATE, Account, Configuration, Credentials, FailFast, Folder
+from exchangelib import (
+    DELEGATE,
+    Account,
+    Configuration,
+    Credentials,
+    EWSDateTime,
+    EWSTimeZone,
+    FailFast,
+    Folder,
+)
 from exchangelib.errors import (
     ErrorFolderNotFound,
     ErrorInvalidIdMalformed,
@@ -172,11 +181,17 @@ def _aqs_quote(value: str) -> str:
     return '"' + value.replace('"', " ").strip() + '"'
 
 
-def build_aqs(query: SearchQuery) -> str | None:
-    """Translate a `SearchQuery` into an Exchange AQS (query string) filter.
+def needs_index(query: SearchQuery) -> bool:
+    """True when the query has terms only Exchange's content index can answer."""
+    return bool(query.text or query.sender or query.recipient)
 
-    AQS is used instead of EWS restrictions because recipient fields are not
-    restrictable in FindItem and free-text search needs the content index anyway.
+
+def build_aqs(query: SearchQuery) -> str | None:
+    """AQS for the index-only terms (free text, sender, recipient).
+
+    Structured filters (dates, unread, attachments, subject) are never put in AQS:
+    the content index on a self-hosted server can be incomplete, and those filters are
+    applied exactly instead (see `build_restriction` and `matches`).
     """
     terms: list[str] = []
     if query.text:
@@ -185,17 +200,51 @@ def build_aqs(query: SearchQuery) -> str | None:
         terms.append(f"from:{_aqs_quote(query.sender)}")
     if query.recipient:
         terms.append(f"to:{_aqs_quote(query.recipient)}")
-    if query.subject:
-        terms.append(f"subject:{_aqs_quote(query.subject)}")
-    if query.since:
-        terms.append(f"received>={query.since.astimezone(UTC):%Y-%m-%d}")
-    if query.until:
-        terms.append(f"received<={query.until.astimezone(UTC):%Y-%m-%d}")
-    if query.has_attachments is not None:
-        terms.append(f"hasattachment:{'true' if query.has_attachments else 'false'}")
-    if query.unread_only:
-        terms.append("isread:false")
     return " AND ".join(terms) if terms else None
+
+
+def _ews_dt(value: datetime) -> EWSDateTime:
+    v = value.astimezone(UTC)
+    return EWSDateTime(v.year, v.month, v.day, v.hour, v.minute, v.second, tzinfo=EWSTimeZone("UTC"))
+
+
+def build_restriction(query: SearchQuery) -> dict[str, Any]:
+    """Keyword filters for an EWS restriction, evaluated by the mailbox store (no index)."""
+    kw: dict[str, Any] = {}
+    if query.since:
+        kw["datetime_received__gte"] = _ews_dt(query.since)
+    if query.until:
+        kw["datetime_received__lte"] = _ews_dt(query.until)
+    if query.has_attachments is not None:
+        kw["has_attachments"] = query.has_attachments
+    if query.unread_only:
+        kw["is_read"] = False
+    if query.subject:
+        kw["subject__icontains"] = query.subject
+    return kw
+
+
+def matches(summary: MessageSummary, query: SearchQuery) -> bool:
+    """Apply the structured filters client-side (used on index search results)."""
+    if query.since and (summary.received is None or summary.received < query.since):
+        return False
+    if query.until and (summary.received is None or summary.received > query.until):
+        return False
+    if query.has_attachments is not None and summary.has_attachments != query.has_attachments:
+        return False
+    if query.unread_only and summary.is_read is not False:
+        return False
+    if query.subject and query.subject.lower() not in (summary.subject or "").lower():
+        return False
+    return True
+
+
+INDEX_SCAN_LIMIT = 1000
+INDEX_NOTE = (
+    "Keyword, sender or recipient searches use the Exchange content index, which may be "
+    "incomplete on this server; results can miss messages. Date, unread, attachment and "
+    "subject filters are exact."
+)
 
 
 class EwsBackend:
@@ -273,19 +322,41 @@ class EwsBackend:
         offset = max(0, offset)
         try:
             target = self._resolve_folder(folder)
-            aqs = build_aqs(query)
-            qs = target.filter(aqs) if aqs else target.all()
-            qs = qs.only(*_LIST_FIELDS).order_by("-datetime_received")
-            items = list(qs[offset : offset + limit + 1])
-            has_more = len(items) > limit
-            summaries = [
-                self._summary(i, folder_name=target.name)
-                for i in items[:limit]
-                if not isinstance(i, Exception)
-            ]
+            if not needs_index(query):
+                # Exact path: restriction evaluated by the store, server-side sort and paging.
+                kw = build_restriction(query)
+                qs = target.filter(**kw) if kw else target.all()
+                qs = qs.only(*_LIST_FIELDS).order_by("-datetime_received")
+                items = [i for i in qs[offset : offset + limit + 1] if not isinstance(i, Exception)]
+                summaries = [self._summary(i, folder_name=target.name) for i in items]
+                return Page(
+                    items=summaries[:limit], offset=offset, limit=limit, has_more=len(summaries) > limit
+                )
+            # Index path: AQS for text/sender/recipient, newest first; re-check the exact
+            # filters on each result and stop early once older than `since`.
+            qs = target.filter(build_aqs(query)).only(*_LIST_FIELDS).order_by("-datetime_received")
+            wanted = offset + limit + 1
+            hits: list[MessageSummary] = []
+            scanned = 0
+            for item in qs.iterator() if hasattr(qs, "iterator") else qs:
+                if isinstance(item, Exception):
+                    continue
+                scanned += 1
+                s = self._summary(item, folder_name=target.name)
+                if query.since and s.received and s.received < query.since:
+                    break
+                if matches(s, query):
+                    hits.append(s)
+                    if len(hits) >= wanted:
+                        break
+                if scanned >= INDEX_SCAN_LIMIT:
+                    break
         except Exception as exc:  # noqa: BLE001
             raise self._translate(exc) from None
-        return Page(items=summaries, offset=offset, limit=limit, has_more=has_more)
+        page = hits[offset : offset + limit]
+        return Page(
+            items=page, offset=offset, limit=limit, has_more=len(hits) > offset + limit, note=INDEX_NOTE
+        )
 
     def get_message(self, message_id: str, *, max_body_chars: int) -> MessageDetail:
         try:
