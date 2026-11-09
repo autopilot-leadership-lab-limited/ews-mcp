@@ -84,15 +84,20 @@ step "5/7 Tailscale"
 # other clouds.
 cat >/etc/systemd/system/alicloud-cgnat-route.service <<'EOF'
 [Unit]
-Description=Route Alibaba Cloud internal services (100.100.0.0/16) via the main table, not Tailscale
-After=network-online.target
+Description=Let Alibaba Cloud internal services (100.100.0.0/16) work next to Tailscale
+After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Routing: send that range through the main table, not into the tailnet.
 ExecStart=/bin/sh -c 'ip rule show | grep -q "to 100.100.0.0/16 lookup main" || ip rule add to 100.100.0.0/16 lookup main priority 5000'
+# Filtering: Tailscale's ts-input chain drops CGNAT-range packets not from tailscale0;
+# let replies from Alibaba's service range in on eth0 (approved by the IT head 2026-11-09).
+ExecStart=/bin/sh -c 'iptables -C INPUT -s 100.100.0.0/16 -i eth0 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -s 100.100.0.0/16 -i eth0 -j ACCEPT'
 ExecStop=/bin/sh -c 'ip rule del to 100.100.0.0/16 lookup main priority 5000 || true'
+ExecStop=/bin/sh -c 'iptables -D INPUT -s 100.100.0.0/16 -i eth0 -j ACCEPT || true'
 
 [Install]
 WantedBy=multi-user.target
