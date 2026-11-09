@@ -77,9 +77,29 @@ cscli collections install crowdsecurity/sshd crowdsecurity/linux crowdsecurity/c
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 
 step "5/7 Tailscale"
-# Alibaba Cloud's internal resolvers (100.100.2.136/138) sit inside the CGNAT range
-# that Tailscale routes into the tailnet, so name resolution dies once tailscaled is
-# up. Use public resolvers outside that range, persistently, before installing it.
+# Alibaba Cloud's internal services (DNS 100.100.2.x, package mirror, metadata
+# 100.100.100.200, Cloud Assistant) live inside 100.64.0.0/10, the CGNAT range that
+# Tailscale routes into the tailnet, so they all go dark once tailscaled is up. Send
+# 100.100.0.0/16 through the main routing table instead, persistently. Harmless on
+# other clouds.
+cat >/etc/systemd/system/alicloud-cgnat-route.service <<'EOF'
+[Unit]
+Description=Route Alibaba Cloud internal services (100.100.0.0/16) via the main table, not Tailscale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip rule show | grep -q "to 100.100.0.0/16 lookup main" || ip rule add to 100.100.0.0/16 lookup main priority 5000'
+ExecStop=/bin/sh -c 'ip rule del to 100.100.0.0/16 lookup main priority 5000 || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now alicloud-cgnat-route
+# Belt and braces: public resolvers outside the CGNAT range as well.
 if [[ -d /run/systemd/resolve ]]; then
   install -d -m 755 /etc/systemd/resolved.conf.d
   cat >/etc/systemd/resolved.conf.d/public-dns.conf <<'EOF'
