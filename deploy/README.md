@@ -91,6 +91,16 @@ from a machine that can reach it, with the pilot user's own login:
    this way is still unread in Outlook.
 3. Only then deploy the hosted server and sign in through an AI app.
 
+## Signing in from an AI app
+
+Add `https://<host>/mcp` as a remote MCP server / custom connector with OAuth; the app registers
+itself and opens the login page. On that page enter the mailbox e-mail and password and leave
+**"Login name, if different" blank** unless step 1 above only worked with `DOMAIN\user`: the login
+form uses the same auto-detected authentication as `ews-mcp check`, and a `DOMAIN\user` login name
+is rejected by servers that accept the e-mail alone. Five rejected attempts from one IP or for one
+e-mail block further attempts for 15 minutes, and repeated failures can also lock the directory
+account, so stop after the first rejection and check the credentials.
+
 ## Operations
 
 - **Backups:** `/var/lib/ews-mcp` (database + `master.key`). Without the key the database is useless;
