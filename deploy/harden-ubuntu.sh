@@ -77,6 +77,18 @@ cscli collections install crowdsecurity/sshd crowdsecurity/linux crowdsecurity/c
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 
 step "5/7 Tailscale"
+# Alibaba Cloud's internal resolvers (100.100.2.136/138) sit inside the CGNAT range
+# that Tailscale routes into the tailnet, so name resolution dies once tailscaled is
+# up. Use public resolvers outside that range, persistently, before installing it.
+if [[ -d /run/systemd/resolve ]]; then
+  install -d -m 755 /etc/systemd/resolved.conf.d
+  cat >/etc/systemd/resolved.conf.d/public-dns.conf <<'EOF'
+[Resolve]
+DNS=223.5.5.5 223.6.6.6 8.8.8.8
+Domains=~.
+EOF
+  systemctl restart systemd-resolved
+fi
 if ! command -v tailscale >/dev/null; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
