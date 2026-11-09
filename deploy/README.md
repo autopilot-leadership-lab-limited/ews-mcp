@@ -16,9 +16,9 @@ sudo bash ~/ews-mcp/deploy/harden-ubuntu.sh
 
 The script is idempotent and prints what it does: updates and automatic security upgrades, a swap
 file, key-only sshd, CrowdSec (blocks scanning and brute-force addresses, community blocklist
-included), a routing rule plus public DNS resolvers so Alibaba Cloud's internal services keep
-working next to Tailscale (they sit inside the CGNAT range Tailscale routes), Tailscale (private
-admin network), Caddy, Python tooling. It ends by telling the
+included), a routing rule so Alibaba Cloud's internal services (DNS, package mirror, metadata,
+Cloud Assistant) keep working next to Tailscale, since they sit inside the CGNAT range Tailscale
+routes, Tailscale (private admin network), Caddy, Python tooling. It ends by telling the
 operator to run `sudo tailscale up --accept-dns=false`, verify SSH over the Tailscale address, and then close public
 port 22 in the security group. Every later admin login goes over Tailscale.
 

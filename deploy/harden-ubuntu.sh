@@ -99,16 +99,6 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now alicloud-cgnat-route
-# Belt and braces: public resolvers outside the CGNAT range as well.
-if [[ -d /run/systemd/resolve ]]; then
-  install -d -m 755 /etc/systemd/resolved.conf.d
-  cat >/etc/systemd/resolved.conf.d/public-dns.conf <<'EOF'
-[Resolve]
-DNS=223.5.5.5 223.6.6.6 8.8.8.8
-Domains=~.
-EOF
-  systemctl restart systemd-resolved
-fi
 if ! command -v tailscale >/dev/null; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
