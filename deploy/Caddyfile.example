@@ -1,0 +1,15 @@
+mail-mcp.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8000 {
+		# Streamable HTTP uses long-lived SSE responses
+		flush_interval -1
+		transport http {
+			read_timeout 0
+		}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}

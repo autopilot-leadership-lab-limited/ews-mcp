@@ -1,0 +1,45 @@
+[project]
+name = "ews-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for a self-hosted Microsoft Exchange mailbox over EWS. No send capability by design."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "mcp>=2.3,<3",
+    "exchangelib>=5.6,<6",
+    "cryptography>=43",
+    "pydantic>=2.7",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+keyring = ["keyring>=25"]
+dev = ["pytest>=8", "pytest-anyio", "ruff>=0.6", "httpx>=0.27"]
+
+[project.scripts]
+ews-mcp = "ews_mcp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ews_mcp"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/ews_mcp/oauth.py" = ["E501"]  # inline HTML
+"src/ews_mcp/cli.py" = ["E501"]
+"src/ews_mcp/store.py" = ["E501"]  # SQL
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
