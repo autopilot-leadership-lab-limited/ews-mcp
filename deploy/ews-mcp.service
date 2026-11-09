@@ -1,0 +1,29 @@
+[Unit]
+Description=ews-mcp: read-only MCP server for Exchange mail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ews-mcp
+Group=ews-mcp
+EnvironmentFile=/etc/ews-mcp.env
+Environment=EWS_MCP_DATA_DIR=/var/lib/ews-mcp
+ExecStart=/opt/ews-mcp/venv/bin/ews-mcp serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ews-mcp
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
