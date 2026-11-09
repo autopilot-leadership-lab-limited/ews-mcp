@@ -162,7 +162,10 @@ def build_server(
         except Exception as exc:
             if exc.__class__.__name__ == "NeedsLogin":
                 raise ToolError(_relogin_message(login_url)) from None
-            raise
+            # Log the traceback for the operator; give the model the error class only,
+            # never the message (it can quote mail content or server details).
+            log.exception("unexpected error in tool for sub=%s", sub)
+            raise ToolError(f"Internal error in the mail connector ({exc.__class__.__name__}).") from None
 
     @mcp.tool(annotations=_READ_ONLY)
     async def list_folders() -> dict[str, Any]:

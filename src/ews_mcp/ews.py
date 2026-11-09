@@ -154,10 +154,17 @@ def _addrs(mailboxes: Any) -> tuple[Address, ...]:
 
 
 def _dt(value: Any) -> datetime | None:
+    """Convert exchangelib's EWSDateTime/EWSDate to a plain, UTC-aware `datetime`.
+
+    EWSDateTime rejects standard `tzinfo` objects in `astimezone`/`replace`, so it is
+    rebuilt as a plain datetime from its UTC timestamp before anything else touches it.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+        if value.tzinfo is None:
+            return datetime(*value.timetuple()[:6], value.microsecond, tzinfo=UTC)
+        return datetime.fromtimestamp(value.timestamp(), tz=UTC)
     return None
 
 
@@ -270,12 +277,14 @@ class EwsBackend:
             qs = target.filter(aqs) if aqs else target.all()
             qs = qs.only(*_LIST_FIELDS).order_by("-datetime_received")
             items = list(qs[offset : offset + limit + 1])
+            has_more = len(items) > limit
+            summaries = [
+                self._summary(i, folder_name=target.name)
+                for i in items[:limit]
+                if not isinstance(i, Exception)
+            ]
         except Exception as exc:  # noqa: BLE001
             raise self._translate(exc) from None
-        has_more = len(items) > limit
-        summaries = [
-            self._summary(i, folder_name=target.name) for i in items[:limit] if not isinstance(i, Exception)
-        ]
         return Page(items=summaries, offset=offset, limit=limit, has_more=has_more)
 
     def get_message(self, message_id: str, *, max_body_chars: int) -> MessageDetail:
@@ -288,7 +297,10 @@ class EwsBackend:
         item = items[0]
         if isinstance(item, Exception):
             raise self._translate(item) from None
-        return self._detail(item, max_body_chars=max_body_chars)
+        try:
+            return self._detail(item, max_body_chars=max_body_chars)
+        except Exception as exc:  # noqa: BLE001
+            raise self._translate(exc) from None
 
     def get_thread(self, conversation_id: str, *, limit: int, max_body_chars: int) -> list[MessageDetail]:
         limit = max(1, min(limit, MAX_PAGE_SIZE))
@@ -300,9 +312,9 @@ class EwsBackend:
                 .order_by("datetime_received")
             )
             items = [i for i in qs[:limit] if not isinstance(i, Exception)]
+            return [self._detail(i, max_body_chars=max_body_chars) for i in items]
         except Exception as exc:  # noqa: BLE001
             raise self._translate(exc) from None
-        return [self._detail(i, max_body_chars=max_body_chars) for i in items]
 
     # -- helpers -----------------------------------------------------------
 
