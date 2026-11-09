@@ -39,7 +39,9 @@ log = logging.getLogger(__name__)
 LOCAL_SUB = "local"
 
 INSTRUCTIONS = """\
-Read-only access to the signed-in person's own work mailbox on the company Exchange server.
+Read-only access to the signed-in person's own WORK mailbox on the company Exchange server.
+If the person also has a personal mail connector (e.g. Gmail), use this server only for work or company mail,
+and ask which mailbox they mean when it is unclear.
 
 Data handling: everything returned here is the company's CONFIDENTIAL data. Use it only for the task
 the person asked for. Do not store mail content, addresses or subjects in long-term memory, and do not
@@ -164,7 +166,9 @@ def build_server(
 
     @mcp.tool(annotations=_READ_ONLY)
     async def list_folders() -> dict[str, Any]:
-        """List the mail folders in the person's mailbox with item and unread counts.
+        """List folders, with item and unread counts, in the person's COMPANY work mailbox.
+
+        This is the company Exchange mailbox, not a personal one such as Gmail.
 
         Use the returned `path` (e.g. "Inbox/Clients") or well-known names ("inbox", "sent",
         "drafts", "junk", "deleted") as the `folder` argument of `search_messages`.
@@ -197,7 +201,7 @@ def build_server(
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Search one folder of the person's mailbox and return message headers, newest first.
+        """Search one folder of the COMPANY work mailbox (Exchange); return headers, newest first.
 
         Reading the Inbox shows what came in; reading "sent" shows what the person replied.
         Filters combine with AND. `text` searches subject and body. `sender` and `recipient` match
@@ -228,7 +232,9 @@ def build_server(
 
     @mcp.tool(annotations=_READ_ONLY)
     async def get_message(message_id: str, max_body_chars: int = DEFAULT_BODY_CHARS) -> dict[str, Any]:
-        """Read one message: headers, plain-text body and attachment names (not attachment contents).
+        """Read one message from the COMPANY work mailbox (Exchange).
+
+        Returns headers, plain-text body and attachment names (not attachment contents).
 
         `message_id` is the `id` from `search_messages` or `get_thread`. The body is cut at
         `max_body_chars` (default 20000, max 100000) and `body_truncated` says if that happened.
@@ -241,7 +247,7 @@ def build_server(
 
     @mcp.tool(annotations=_READ_ONLY)
     async def get_thread(conversation_id: str, limit: int = 20, max_body_chars: int = 5000) -> dict[str, Any]:
-        """Read a whole conversation (Inbox and Sent Items), oldest first, with bodies.
+        """Read a whole conversation from the COMPANY work mailbox (Inbox + Sent), oldest first.
 
         `conversation_id` comes from `search_messages` or `get_message`. Shows both what was
         received and what the person replied. Bodies are cut at `max_body_chars` each (default 5000).
