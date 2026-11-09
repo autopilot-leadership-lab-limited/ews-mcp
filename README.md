@@ -78,14 +78,32 @@ conditions in `exchange-mail.md` ("Before a second person is connected") must be
 
 ## Local mode
 
+macOS / Linux:
+
 ```sh
+python3 -m venv .venv && source .venv/bin/activate
 pip install '.[keyring]'
 export EWS_MCP_EXCHANGE_HOST=mail.example.com EWS_MCP_EMAIL=you@example.com
 # optional, when the login name differs from the e-mail:
 export EWS_MCP_USERNAME='DOMAIN\you'
-ews-mcp set-password        # stored in the OS keyring (Windows Credential Manager, macOS Keychain)
+ews-mcp set-password        # prompts for the password; stored in the OS keyring
 ews-mcp check               # verifies the login and lists folders
 ```
+
+Windows (PowerShell; needs Python 3.11+ from python.org with "Add to PATH" ticked):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1      # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+python -m pip install -e ".[keyring]"
+$env:EWS_MCP_EXCHANGE_HOST = "mail.example.com"
+$env:EWS_MCP_EMAIL = "you@example.com"
+# $env:EWS_MCP_USERNAME = "DOMAIN\you"   # only if the login name differs
+ews-mcp set-password            # prompts; stored in Windows Credential Manager
+ews-mcp check
+```
+
+`$env:` settings last for that window only; the AI client config below sets them per launch.
 
 Then register `ews-mcp stdio` in the AI app. Generic MCP config (Claude Desktop, Cursor, VS Code,
 Gemini CLI and most others accept this shape):
