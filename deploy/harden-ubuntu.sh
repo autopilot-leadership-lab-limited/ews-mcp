@@ -97,7 +97,10 @@ apt-get install -y -q python3-venv python3-pip git sqlite3
 step "Done"
 cat <<'EOF'
 Next (operator):
-  1. sudo tailscale up            -> open the printed link, sign in, approve the machine
+  1. sudo tailscale up --accept-dns=false
+                                  -> open the printed link, sign in, approve the machine
+                                     (--accept-dns=false keeps the cloud DNS; Tailscale DNS
+                                     broke name resolution on the first Alibaba Cloud VM)
      tailscale ip -4              -> note the 100.x address; test:  ssh ecs-user@<100.x>
   2. In the cloud console, remove the public SSH (22) rule from the security group.
   3. Continue with deploy/README.md to install ews-mcp and Caddy config.

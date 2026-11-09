@@ -17,7 +17,7 @@ sudo bash ~/ews-mcp/deploy/harden-ubuntu.sh
 The script is idempotent and prints what it does: updates and automatic security upgrades, a swap
 file, key-only sshd, CrowdSec (blocks scanning and brute-force addresses, community blocklist
 included), Tailscale (private admin network), Caddy, Python tooling. It ends by telling the
-operator to run `sudo tailscale up`, verify SSH over the Tailscale address, and then close public
+operator to run `sudo tailscale up --accept-dns=false` (keep the cloud DNS; Tailscale DNS broke name resolution on the first VM), verify SSH over the Tailscale address, and then close public
 port 22 in the security group. Every later admin login goes over Tailscale.
 
 ## 1. Install
