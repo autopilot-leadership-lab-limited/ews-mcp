@@ -58,6 +58,19 @@ class HostedConfig:
         )
 
 
+def _installed_commit() -> str | None:
+    """The git commit this package was installed from (pip records it), so anyone can check
+    which public code the server runs. None for a plain or editable install."""
+    try:
+        import json
+        from importlib.metadata import distribution
+
+        raw = distribution("ews-mcp").read_text("direct_url.json")
+        return json.loads(raw).get("vcs_info", {}).get("commit_id") if raw else None
+    except Exception:
+        return None
+
+
 def build_app(config: HostedConfig, *, backend_factory: BackendFactory | None = None) -> Starlette:
     key = load_or_create_master_key(config.data_dir / "master.key")
     store = Store(config.data_dir / "ews-mcp.sqlite3", key)
@@ -94,7 +107,7 @@ def build_app(config: HostedConfig, *, backend_factory: BackendFactory | None = 
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_: Request) -> Response:
-        return JSONResponse({"ok": True, "version": __version__})
+        return JSONResponse({"ok": True, "version": __version__, "commit": _installed_commit()})
 
     @mcp.custom_route("/", methods=["GET"])
     async def index(_: Request) -> Response:
@@ -118,4 +131,5 @@ def build_app(config: HostedConfig, *, backend_factory: BackendFactory | None = 
     )
     app.state.store = store
     app.state.accounts = accounts
+    app.state.provider = provider
     return app
