@@ -103,10 +103,13 @@ account, so stop after the first rejection and check the credentials.
 
 ## Operations
 
-- **Backups:** `/var/lib/ews-mcp` (database + `master.key`). Without the key the database is useless;
-  with both, it holds encrypted mailbox passwords, so treat the backup as `restricted`.
+- **Backups:** `/var/lib/ews-mcp`. Passwords in it are sealed to keys that only the AI apps' tokens
+  unlock, so the backup alone opens no mailbox; it still lists who is connected, so treat it as
+  `confidential`.
 - **Logs:** `journalctl -u ews-mcp`. They contain tool names, subjects (`sub`, the signed-in e-mail)
   and errors, never mail content.
 - **Removing a person:** delete their row in `users` (`sqlite3 /var/lib/ews-mcp/ews-mcp.sqlite3
-  "DELETE FROM users WHERE sub='x@example.com'"`); their tokens stop working at once.
+  "DELETE FROM users WHERE sub='x@example.com'"`); their tokens stop working at once. Their sealed
+  passwords can no longer be opened and are purged on the next start (`purge_expired`) once their
+  tokens expire; to drop them at once also run `DELETE FROM grants WHERE sub='x@example.com'`.
 - **Upgrading:** `pip install git+…@vX.Y.Z` into the venv, then `systemctl restart ews-mcp`.

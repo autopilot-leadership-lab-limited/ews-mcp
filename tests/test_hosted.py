@@ -350,3 +350,139 @@ def test_additional_mailboxes_page_and_tools(client: TestClient, state: dict[str
     assert r.status_code == 200 and store.list_mailboxes("pilot@example.com") == []
     result = call_tool(client, token, "list_folders", {"mailbox": "info@example.com"})
     assert result["isError"] is True and "No mailbox" in result["content"][0]["text"]
+
+
+def _db_bytes(tmp_path: Path) -> bytes:
+    data = b""
+    for f in (tmp_path / "data").glob("ews-mcp.sqlite3*"):
+        data += f.read_bytes()
+    return data
+
+
+def test_server_cannot_open_passwords_without_the_apps_token(
+    client: TestClient, state: dict[str, str], tmp_path: Path
+) -> None:
+    state["info@example.com"] = "info-pass"
+    client_id = register(client)
+    code, verifier = sign_in(client, client_id, "good-password")
+    tokens = exchange(client, client_id, code, verifier)
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "info-pass",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (
+        call_tool(client, tokens["access_token"], "list_folders", {"mailbox": "info@example.com"}).get(
+            "isError"
+        )
+        is not True
+    )
+
+    # Neither password is anywhere in the database files, in any encoding the server could undo alone.
+    raw = _db_bytes(tmp_path)
+    assert b"good-password" not in raw and b"info-pass" not in raw
+    assert tokens["access_token"].encode() not in raw and tokens["refresh_token"].encode() not in raw
+
+    # The server process itself, without a request token, cannot build a backend.
+    accounts = client.app.state.accounts
+    accounts._cache.clear()
+    from ews_mcp.accounts import NeedsLogin
+
+    with pytest.raises(NeedsLogin):
+        accounts.backend_for("pilot@example.com", None)
+    with pytest.raises(NeedsLogin):
+        accounts.backend_for("pilot@example.com", None, token="forged-token")
+
+    # Refresh keeps the key usable under the new tokens.
+    r = client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+            "client_id": client_id,
+        },
+    )
+    new = r.json()
+    accounts._cache.clear()
+    assert (
+        call_tool(client, new["access_token"], "list_folders", {"mailbox": "info@example.com"}).get("isError")
+        is not True
+    )
+
+    # Revoking the connection deletes its key and sealed passwords.
+    import anyio
+    from mcp.server.auth.provider import RefreshToken
+
+    provider = client.app.state.provider
+    rt = RefreshToken(token=new["refresh_token"], client_id=client_id, scopes=["mail.read"])
+    anyio.run(provider.revoke_token, rt)
+    assert client.app.state.store.list_grants("pilot@example.com") == []
+
+
+def test_second_app_connection_and_password_change(client: TestClient, state: dict[str, str]) -> None:
+    state["info@example.com"] = "info-pass"
+    c1 = register(client)
+    code, verifier = sign_in(client, c1, "good-password")
+    t1 = exchange(client, c1, code, verifier)["access_token"]
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "info-pass",
+        },
+    )
+    assert r.status_code == 200
+
+    # A second AI app connects later: its own key; the extra mailbox is not readable there yet.
+    c2 = register(client)
+    code, verifier = sign_in(client, c2, "good-password")
+    t2 = exchange(client, c2, code, verifier)["access_token"]
+    boxes = call_tool(client, t2, "list_mailboxes")["structuredContent"]["mailboxes"]
+    assert [b["needs_password"] for b in boxes] == [False, True]
+    result = call_tool(client, t2, "list_folders", {"mailbox": "info@example.com"})
+    assert result["isError"] is True and "/mailboxes" in result["content"][0]["text"]
+    assert call_tool(client, t2, "list_folders").get("isError") is not True
+
+    # Adding it again seals it for both connections.
+    client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "info-pass",
+        },
+    )
+    for t in (t1, t2):
+        assert (
+            call_tool(client, t, "list_folders", {"mailbox": "info@example.com"}).get("isError") is not True
+        )
+
+    # The main password changes: one /relogin re-seals it for every connection.
+    state["password"] = "new-password"
+    client.app.state.accounts._cache.clear()
+    assert call_tool(client, t1, "list_folders")["isError"] is True
+    r = client.post("/relogin", data={"email": "pilot@example.com", "password": "new-password"})
+    assert r.status_code == 200
+    for t in (t1, t2):
+        assert call_tool(client, t, "list_folders").get("isError") is not True
+
+
+def test_mailboxes_page_rejects_unconnected_or_wrong_owner(client: TestClient) -> None:
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "stranger@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "x",
+        },
+    )
+    assert r.status_code == 401

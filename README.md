@@ -23,7 +23,7 @@ This is ALLab's first AI workflow; the rules it implements are in
 | Who it serves | Many people, each with their own login | One person, on their own computer |
 | AI clients | Any that supports remote MCP: desktop, web **and mobile** apps | Desktop apps and CLIs only |
 | Sign-in | OAuth 2.1 between the AI client and this server; the person enters their Exchange password **once** on this server's login page | Password from the OS keyring or an env var |
-| Where the Exchange password lives | Encrypted (Fernet) in SQLite on the server; master key in a separate file | The person's OS keyring |
+| Where the Exchange password lives | On the server, sealed to a key that only the person's AI app connection can unlock (zero-knowledge storage, below) | The person's OS keyring |
 
 The AI vendor never sees the Exchange password in either mode. In hosted mode it only holds an
 OAuth token issued by this server.
@@ -77,17 +77,40 @@ never retries, so it cannot lock the directory account) and the AI tells them to
 
 A signed-in person can connect more mailboxes that have their own Exchange login (department or
 shared mailboxes with a separate password), up to 10, at `/mailboxes`. The page asks for their
-main e-mail and password, compared with the stored one (no call to Exchange), then the other
-mailbox's address and password, which is verified against Exchange once and stored encrypted like
-the main one. Adding the same address again replaces its password; "Remove" deletes it.
+main e-mail and password, checked against Exchange (failed checks are limited to 5 per 15 minutes),
+then the other mailbox's address and password, which is verified against Exchange once and sealed
+to each of the person's AI app connections that exist at that moment. A connection made later (a
+new app, or signing in again after 30 days unused) needs the mailbox added again. Adding the same
+address again replaces its password; "Remove" deletes it.
 
 Tools take an optional `mailbox` argument (an address from `list_mailboxes`; empty = the main
 mailbox). If one mailbox's password stops working, only that mailbox stops; the others keep working.
 
+### Zero-knowledge password storage
+
+The server cannot read a stored Exchange password on its own. Each AI app connection (OAuth grant)
+gets an X25519 key pair. Passwords are sealed to its public key; its private key is stored only
+wrapped under the authorization code and then the access and refresh tokens, which the database
+keeps as SHA-256 hashes. A password is opened in memory only while a request carries that app's
+token (`src/ews_mcp/sealing.py`). The database and `master.key`, together or apart, open nothing.
+
+Consequences: signing in again from the same app after the refresh token lapsed (30 days unused)
+creates a new connection; additional mailboxes are added again there. Revoking a connection deletes
+its key and sealed passwords. A changed password entered once at `/relogin` is re-sealed for every
+connection.
+
+Limit: this is verifiable trust, not an impossibility. Whoever runs the server could change the code
+to log passwords as they arrive. So the code is public, deployments are pinned to a commit, and
+`/health` reports the installed commit for anyone to compare with this repository.
+
+Upgrading a server from the earlier master-key storage erases the stored passwords and all tokens
+on first start; each person connects their AI app again once.
+
 ### Adding a second person
 
-The pilot deployment serves one person. Before anyone else is connected, one of the three
-conditions in `exchange-mail.md` ("Before a second person is connected") must be in place.
+Before anyone besides the pilot person connects, the conditions in `exchange-mail.md` ("Before a
+second person is connected") must be met: zero-knowledge storage (above) is the option chosen, and
+BU management signs off.
 
 ## Local mode
 
@@ -188,7 +211,8 @@ searches before rollout; see the checklist in `deploy/README.md`.
 src/ews_mcp/
   backend.py   MailBackend interface and data models (read-only by construction)
   ews.py       EWS implementation (exchangelib); only FindFolder/GetFolder/FindItem/GetItem
-  store.py     SQLite: encrypted logins, OAuth clients, codes, hashed tokens
+  store.py     SQLite: people, mailboxes, connections (grants), sealed passwords, hashed tokens
+  sealing.py   Zero-knowledge sealing: X25519 + HKDF + AES-GCM, keys wrapped under OAuth tokens
   accounts.py  Person + mailbox -> backend; stops on the first auth failure, per mailbox
   oauth.py     OAuth 2.1 authorization server + sign-in pages
   tools.py     The MCP server and its five tools
