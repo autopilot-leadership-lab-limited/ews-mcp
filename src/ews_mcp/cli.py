@@ -65,11 +65,14 @@ def _extra_credentials(args: argparse.Namespace, primary_email: str):
         try:
             import keyring  # type: ignore
 
-            password = keyring.get_password(KEYRING_SERVICE, addr) or ""
+            stored = keyring.get_password(KEYRING_SERVICE, addr)
         except ImportError:
-            password = ""
-        if not password:
+            stored = None
+        if stored is None:
             sys.exit(f"No password for {addr}: run `ews-mcp set-password --email {addr}`")
+        if not stored:
+            sys.exit(f"The stored password for {addr} is empty: run `ews-mcp set-password --email {addr}`")
+        password = stored
         out.append(EwsCredentials(email=addr, username=addr, password=password))
     return out
 
@@ -141,6 +144,10 @@ def cmd_set_password(args: argparse.Namespace) -> None:
         sys.exit("Install the keyring extra: pip install 'ews-mcp[keyring]'")
     email = args.email or os.environ.get("EWS_MCP_EMAIL", "").strip() or input("Work e-mail: ").strip()
     password = getpass.getpass(f"Exchange password for {email}: ")
+    if not password:
+        sys.exit("Empty password: nothing stored. Type (or Ctrl+V) the password, then press Enter.")
+    if getpass.getpass("Again, to confirm: ") != password:
+        sys.exit("The two entries differ: nothing stored.")
     keyring.set_password(KEYRING_SERVICE, email, password)
     print("Stored in the system keyring.")
 
