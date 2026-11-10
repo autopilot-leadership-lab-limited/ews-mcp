@@ -118,13 +118,27 @@ ews-mcp check
 
 `$env:` settings last for that window only; the AI client config below sets them per launch.
 
+Notes for Windows:
+
+- The password prompt shows nothing while you type; that is normal. `set-password` asks twice and
+  refuses an empty or mismatched entry.
+- Leave `EWS_MCP_USERNAME` unset unless your Exchange rejects the e-mail address as login name.
+- `ews-mcp check` stops at the first rejected login and never retries. Fix the password with
+  `set-password` before running it again; repeated failures can lock the directory account.
+- Fully quit the AI app (Claude Desktop: tray icon, then Quit) before `pip install`, and after
+  changing its config. A running `ews-mcp.exe` is locked and a reinstall over it breaks the install.
+
 **Additional mailboxes (local):** list their addresses in `EWS_MCP_EXTRA_MAILBOXES`, comma
 separated, and store each password once with `ews-mcp set-password --email <address>`. They sign
 in with the address as login name. `ews-mcp check` then tests every mailbox and stops at the first
 rejected login.
 
 Then register `ews-mcp stdio` in the AI app. Generic MCP config (Claude Desktop, Cursor, VS Code,
-Gemini CLI and most others accept this shape):
+Gemini CLI and most others accept this shape). If you installed into a venv, `command` must be the
+full path to the venv's executable, with each backslash doubled in JSON (e.g. `C:\\path\\to\\ews-mcp\\.venv\\Scripts\\ews-mcp.exe`), because
+the AI app does not activate the venv. In Claude Desktop the file is under Settings, Developer, Edit
+Config; the Microsoft Store build keeps it under `%LOCALAPPDATA%` instead (search for
+`claude_desktop_config.json`).
 
 ```json
 {
