@@ -3,14 +3,17 @@
 Flow: the AI client registers itself (dynamic client registration), sends the
 person to `/authorize`, and we redirect them to our own `/login` page. There
 they enter their Exchange username and password once. We verify the password
-against EWS, store it encrypted, mint an authorization code, and send the
-browser back to the client's redirect URI. The client exchanges the code for
+against EWS, create a key pair for this connection, seal the password to it,
+wrap the private key under the authorization code we mint (and later under the
+tokens), and send the browser back to the client's redirect URI. The server
+keeps no key that opens the password without one of those tokens. The client exchanges the code for
 an access token (1 hour) and a refresh token (30 days). The AI vendor only
 ever holds our tokens, never the Exchange password.
 """
 
 from __future__ import annotations
 
+import base64
 import html
 import logging
 import secrets
@@ -33,9 +36,10 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from .accounts import StoreAccounts
+from .accounts import NeedsLogin, StoreAccounts
 from .backend import AuthFailed, BackendUnavailable
-from .store import Store
+from .sealing import SealError, unwrap_key, wrap_key
+from .store import Store, StoredUser
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +57,19 @@ class RateLimiter:
         self._window = window
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+
+    def blocked(self, key: str) -> bool:
+        """True when `key` already has `limit` hits in the window; records nothing."""
+        now = time.time()
+        with self._lock:
+            q = self._hits[key]
+            while q and q[0] < now - self._window:
+                q.popleft()
+            return len(q) >= self._limit
+
+    def hit(self, key: str) -> None:
+        with self._lock:
+            self._hits[key].append(time.time())
 
     def allow(self, key: str) -> bool:
         now = time.time()
@@ -72,7 +89,10 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         self._accounts = accounts
         self._base = base_url.rstrip("/")
         self._limiter = RateLimiter()
-        self._page_limiter = RateLimiter(limit=10)  # /mailboxes: password check is local, allow a few more
+        self._page_limiter = RateLimiter(limit=10)
+        self._owner_failures = RateLimiter(
+            limit=5
+        )  # failed main-password checks on /mailboxes  # /mailboxes: password check is local, allow a few more
 
     # -- clients -------------------------------------------------------------
 
@@ -103,19 +123,38 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
+        data = self._store.get_code(authorization_code.code) or {}
         self._store.delete_code(authorization_code.code)
         if not authorization_code.subject:
             raise TokenError("invalid_grant", "Authorization code has no subject")
+        grant_id = data.get("grant_id")
+        try:
+            priv = unwrap_key(
+                base64.b64decode(data.get("wrapped_key", "")), authorization_code.code, context=grant_id or ""
+            )
+        except (SealError, ValueError):
+            raise TokenError("invalid_grant", "Authorization code has no usable key") from None
         return self._issue(
             client_id=authorization_code.client_id,
             sub=authorization_code.subject,
             scopes=authorization_code.scopes,
             resource=authorization_code.resource,
+            grant_id=grant_id,
+            private_key=priv,
         )
 
     # -- tokens --------------------------------------------------------------
 
-    def _issue(self, *, client_id: str, sub: str, scopes: list[str], resource: str | None) -> OAuthToken:
+    def _issue(
+        self,
+        *,
+        client_id: str,
+        sub: str,
+        scopes: list[str],
+        resource: str | None,
+        grant_id: str,
+        private_key: bytes,
+    ) -> OAuthToken:
         pair_id = secrets.token_urlsafe(16)
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
@@ -129,6 +168,8 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             scopes=scopes,
             resource=resource,
             expires_at=now + ACCESS_TTL,
+            grant_id=grant_id,
+            wrapped_key=wrap_key(private_key, access, context=grant_id),
         )
         self._store.save_token(
             refresh,
@@ -139,6 +180,8 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             scopes=scopes,
             resource=resource,
             expires_at=now + REFRESH_TTL,
+            grant_id=grant_id,
+            wrapped_key=wrap_key(private_key, refresh, context=grant_id),
         )
         return OAuthToken(
             access_token=access,
@@ -171,12 +214,25 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             raise TokenError("invalid_grant", "Refresh token is not valid")
         if any(s not in t.scopes for s in scopes):
             raise TokenError("invalid_scope", "Requested scope exceeds the original grant")
+        if not t.grant_id or not t.wrapped_key:
+            raise TokenError("invalid_grant", "Refresh token has no usable key")
+        try:
+            priv = unwrap_key(t.wrapped_key, refresh_token.token, context=t.grant_id)
+        except SealError:
+            raise TokenError("invalid_grant", "Refresh token has no usable key") from None
         self._store.delete_token_pair(t.pair_id)  # rotation: old access + refresh both die
-        return self._issue(client_id=t.client_id, sub=t.sub, scopes=scopes or t.scopes, resource=t.resource)
+        return self._issue(
+            client_id=t.client_id,
+            sub=t.sub,
+            scopes=scopes or t.scopes,
+            resource=t.resource,
+            grant_id=t.grant_id,
+            private_key=priv,
+        )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         t = self._store.get_token(token, "access")
-        if not t:
+        if not t or not t.grant_id:
             return None
         user = self._store.get_user(t.sub)
         if user is None:
@@ -195,6 +251,8 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         t = self._store.get_token(token.token, kind)
         if t:
             self._store.delete_token_pair(t.pair_id)
+            if t.grant_id:
+                self._store.delete_grant(t.grant_id)  # the connection is gone; so are its sealed passwords
 
     # -- login pages (registered as custom routes, no bearer auth) -----------
 
@@ -214,9 +272,12 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         result = await self._try_login(request, form)
         if isinstance(result, Response):
             return result
-        user_sub = result
+        user, password = result
+        user_sub = user.sub
         self._store.pop_txn(txn)
         code = secrets.token_urlsafe(32)
+        grant_id, priv = self._accounts.new_grant(user, client_id, password)
+        del password
         self._store.save_code(
             code,
             {
@@ -229,6 +290,8 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
                 "redirect_uri_provided_explicitly": params["redirect_uri_provided_explicitly"],
                 "resource": params.get("resource"),
                 "subject": user_sub,
+                "grant_id": grant_id,
+                "wrapped_key": base64.b64encode(wrap_key(priv, code, context=grant_id)).decode(),
             },
             expires_at=time.time() + CODE_TTL,
         )
@@ -253,9 +316,10 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
     async def mailboxes_post(self, request: Request) -> Response:
         """Add, update or remove an additional mailbox.
 
-        The person proves who they are with their main login, which is compared with the
-        stored password (no call to Exchange, so a typo cannot lock the directory account).
-        The additional mailbox's own password is verified against Exchange once before storing.
+        The person proves who they are with their main login, checked against Exchange (the
+        server stores nothing it could compare it with); attempts are rate-limited per address.
+        The additional mailbox's own password is verified against Exchange once, then sealed
+        to each of the person's connections.
         """
         form = await request.form()
         owner_email = str(form.get("owner_email", "")).strip()
@@ -274,18 +338,28 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         ):
             log.warning("mailboxes page rate limit hit for ip=%s", ip)
             return HTMLResponse(_page("Too many attempts. Wait 15 minutes and try again."), 429)
-        owner_sub = self._store.sub_for_email(owner_email)
-        owner = self._store.get_user(owner_sub)
-        if owner is None or not self._store.check_password(owner_sub, owner_password):
-            log.info("mailboxes page: main login not matched for ip=%s", ip)
+        owner_key = owner_email.lower()
+        if self._owner_failures.blocked(owner_key):
+            return HTMLResponse(_page("Too many attempts. Wait 15 minutes and try again."), 429)
+        try:
+            owner = await anyio.to_thread.run_sync(self._accounts.verify_owner, owner_email, owner_password)
+        except (NeedsLogin, AuthFailed):
+            self._owner_failures.hit(owner_key)
+            log.info("mailboxes page: main login not accepted for ip=%s", ip)
             return HTMLResponse(
                 _page(
                     "That main e-mail and password do not match a connected account. "
-                    "If you changed your password, update it at /relogin first.",
+                    "Connect your AI app first, or check the password.",
                     back=True,
                 ),
                 401,
             )
+        except BackendUnavailable as exc:
+            log.warning("mailboxes page could not reach Exchange: %s", exc)
+            return HTMLResponse(
+                _page("The mail server could not be reached. Try again in a few minutes."), 502
+            )
+        owner_sub = owner.sub
         if action == "remove":
             removed = self._accounts.remove_mailbox(owner_sub, email)
             log.info("additional mailbox %s for sub=%s", "removed" if removed else "not found", owner_sub)
@@ -321,7 +395,7 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             _page("Mailbox connected. Your AI can now read it; ask it to list your mailboxes.")
         )
 
-    async def _try_login(self, request: Request, form: Any) -> str | Response:
+    async def _try_login(self, request: Request, form: Any) -> tuple[StoredUser, str] | Response:
         email = str(form.get("email", "")).strip()
         username = str(form.get("username", "")).strip() or email
         password = str(form.get("password", ""))
@@ -344,7 +418,7 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
                 _page("The mail server could not be reached. Try again in a few minutes."), 502
             )
         log.info("login ok for sub=%s", user.sub)
-        return user.sub
+        return user, password
 
 
 # -- HTML ---------------------------------------------------------------------
@@ -368,7 +442,8 @@ def _login_form(*, action: str, txn: str | None) -> str:
 <title>Connect your work mailbox</title><style>{_STYLE}</style>
 <h1>Connect your work mailbox</h1>
 <p>Sign in with your <b>company Exchange</b> login. The password is checked against the mail server, then
-stored encrypted on this connector so your AI can read your mailbox. 用公司 Exchange 帳號登入；密碼會先經郵件伺服器驗證，再加密儲存在此連接器。</p>
+stored locked to your AI app's connection: this server cannot open it unless your AI app makes a request.
+用公司 Exchange 帳號登入；密碼經郵件伺服器驗證後，以你 AI app 的連線鎖住儲存：只有你的 AI app 發出請求時，伺服器才能打開。</p>
 <form method=post action="{action}" autocomplete=on>{hidden}
 <label for=email>Work e-mail 公司電郵</label>
 <input id=email name=email type=email required autocomplete=username inputmode=email>
@@ -405,6 +480,8 @@ AI can read it too. Adding it again with a new password updates it. 連接另一
 <input id=password name=password type=password autocomplete=new-password>
 <button type=submit>Save 儲存</button>
 </form>
-<div class=note>Read-only, like your main mailbox. Each password is checked once against the mail server and stored
-encrypted. If one stops working, only that mailbox stops; enter it again here. 只能讀取；密碼經伺服器驗證後加密儲存。</div>
+<div class=note>Read-only, like your main mailbox. Your main password is checked against the mail server. Each
+mailbox password is checked once, then locked to your AI app connections that exist now; if you connect another AI
+app later, add the mailbox again. If one stops working, only that mailbox stops; enter it again here.
+只能讀取；密碼經伺服器驗證後，以你現有 AI app 連線鎖住儲存。日後新連接的 AI app 需要再加一次。</div>
 """

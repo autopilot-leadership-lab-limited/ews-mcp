@@ -65,11 +65,13 @@ _READ_ONLY = ToolAnnotations(
 
 
 class Accounts(Protocol):
-    def backend_for(self, sub: str, mailbox: str | None = None) -> MailBackend: ...
+    def backend_for(
+        self, sub: str, mailbox: str | None = None, *, token: str | None = None
+    ) -> MailBackend: ...
 
     def on_auth_failed(self, sub: str, mailbox: str | None = None) -> str | None: ...
 
-    def mailboxes(self, sub: str) -> list[Any]: ...
+    def mailboxes(self, sub: str, *, token: str | None = None) -> list[Any]: ...
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -145,6 +147,12 @@ def build_server(
     )
     authenticated = auth is not None
 
+    def current_token() -> str | None:
+        if not authenticated:
+            return None
+        token = get_access_token()
+        return token.token if token else None
+
     def current_sub() -> str:
         if not authenticated:
             return LOCAL_SUB
@@ -157,7 +165,7 @@ def build_server(
         """Run a blocking backend call off the event loop, translating errors for the model."""
         sub = current_sub()
         try:
-            backend = accounts.backend_for(sub, mailbox)
+            backend = accounts.backend_for(sub, mailbox, token=current_token())
             return await anyio.to_thread.run_sync(lambda: fn(backend, *args, **kwargs))
         except AuthFailed:
             extra = accounts.on_auth_failed(sub, mailbox)
@@ -188,7 +196,7 @@ def build_server(
         """
         sub = current_sub()
         try:
-            boxes = accounts.mailboxes(sub)
+            boxes = accounts.mailboxes(sub, token=current_token())
         except Exception as exc:
             if exc.__class__.__name__ == "NeedsLogin":
                 raise ToolError(_relogin_message(login_url, mailboxes_url, None)) from None
