@@ -32,7 +32,7 @@ class PasswordCheckingBackend(FakeBackend):
 
     def _check(self) -> None:
         assert self.creds is not None
-        if self.creds.password != self._state["password"]:
+        if self.creds.password != self._state.get(self.creds.email.lower(), self._state["password"]):
             raise AuthFailed("bad password")
 
 
@@ -249,3 +249,104 @@ def test_login_rate_limit(client: TestClient) -> None:
         client.post("/relogin", data={"email": "x@example.com", "password": "wrong"})
     r = client.post("/relogin", data={"email": "x@example.com", "password": "wrong"})
     assert r.status_code == 429
+
+
+def test_additional_mailboxes_page_and_tools(client: TestClient, state: dict[str, str]) -> None:
+    state["info@example.com"] = "info-pass"
+    client_id = register(client)
+    code, verifier = sign_in(client, client_id, "good-password")
+    token = exchange(client, client_id, code, verifier)["access_token"]
+    store = client.app.state.store
+
+    assert "Additional mailboxes" in client.get("/mailboxes").text
+
+    # The main login is checked against the stored password before anything else.
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "wrong",
+            "email": "info@example.com",
+            "password": "info-pass",
+        },
+    )
+    assert r.status_code == 401 and store.list_mailboxes("pilot@example.com") == []
+
+    # A wrong password for the additional mailbox is rejected by Exchange and not stored.
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "nope",
+        },
+    )
+    assert r.status_code == 401 and store.list_mailboxes("pilot@example.com") == []
+
+    # Adding the main mailbox as an extra is refused.
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "Pilot@example.com",
+            "password": "good-password",
+        },
+    )
+    assert r.status_code == 400
+
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "Pilot@Example.com",
+            "owner_password": "good-password",
+            "email": "Info@Example.com",
+            "password": "info-pass",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    boxes = call_tool(client, token, "list_mailboxes")["structuredContent"]["mailboxes"]
+    assert [(b["address"], b["primary"]) for b in boxes] == [
+        ("Pilot@Example.com", True),
+        ("Info@Example.com", False),
+    ]
+    result = call_tool(client, token, "search_messages", {"folder": "sent", "mailbox": "info@example.com"})
+    assert result["structuredContent"]["mailbox"] == "info@example.com"
+
+    # The department mailbox's password changes: only that mailbox stops.
+    state["info@example.com"] = "changed"
+    client.app.state.accounts._cache.clear()
+    result = call_tool(client, token, "list_folders", {"mailbox": "info@example.com"})
+    assert result["isError"] is True and f"{BASE}/mailboxes" in result["content"][0]["text"]
+    assert store.get_mailbox("pilot@example.com", "info@example.com").needs_relogin is True
+    assert store.get_user("pilot@example.com").needs_relogin is False
+    assert call_tool(client, token, "list_folders").get("isError") is not True
+
+    # Re-adding with the new password fixes it; removing deletes the stored password.
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "email": "info@example.com",
+            "password": "changed",
+        },
+    )
+    assert r.status_code == 200
+    assert (
+        call_tool(client, token, "list_folders", {"mailbox": "info@example.com"}).get("isError") is not True
+    )
+    r = client.post(
+        "/mailboxes",
+        data={
+            "owner_email": "pilot@example.com",
+            "owner_password": "good-password",
+            "action": "remove",
+            "email": "info@example.com",
+        },
+    )
+    assert r.status_code == 200 and store.list_mailboxes("pilot@example.com") == []
+    result = call_tool(client, token, "list_folders", {"mailbox": "info@example.com"})
+    assert result["isError"] is True and "No mailbox" in result["content"][0]["text"]

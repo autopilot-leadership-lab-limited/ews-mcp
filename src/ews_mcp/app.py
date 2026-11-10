@@ -78,13 +78,19 @@ def build_app(config: HostedConfig, *, backend_factory: BackendFactory | None = 
         validate_token_resource=False,
     )
     mcp = build_server(
-        accounts, login_url=f"{config.base_url}/relogin", auth=auth, auth_server_provider=provider
+        accounts,
+        login_url=f"{config.base_url}/relogin",
+        mailboxes_url=f"{config.base_url}/mailboxes",
+        auth=auth,
+        auth_server_provider=provider,
     )
 
     mcp.custom_route("/login", methods=["GET"])(provider.login_get)
     mcp.custom_route("/login", methods=["POST"])(provider.login_post)
     mcp.custom_route("/relogin", methods=["GET"])(provider.relogin_get)
     mcp.custom_route("/relogin", methods=["POST"])(provider.relogin_post)
+    mcp.custom_route("/mailboxes", methods=["GET"])(provider.mailboxes_get)
+    mcp.custom_route("/mailboxes", methods=["POST"])(provider.mailboxes_post)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_: Request) -> Response:
@@ -98,6 +104,7 @@ def build_app(config: HostedConfig, *, backend_factory: BackendFactory | None = 
             f"<p>Read-only MCP server for the company mailbox. Add <code>{mcp_url}</code> to your AI app "
             "as a remote MCP server; it will send you here to sign in.</p>"
             '<p>Changed your password? <a href="/relogin">Update it here</a>.</p>'
+            '<p>Another mailbox with its own login? <a href="/mailboxes">Add it here</a>.</p>'
         )
 
     public_host = urlparse(config.base_url).netloc

@@ -8,6 +8,7 @@ hashes, so the database alone yields neither passwords nor usable tokens.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -55,7 +56,20 @@ CREATE TABLE IF NOT EXISTS tokens (
     expires_at REAL
 );
 CREATE INDEX IF NOT EXISTS tokens_pair ON tokens(pair_id);
+CREATE TABLE IF NOT EXISTS extra_mailboxes (
+    owner_sub TEXT NOT NULL,
+    address TEXT NOT NULL,
+    email TEXT NOT NULL,
+    username TEXT NOT NULL,
+    enc_password BLOB NOT NULL,
+    needs_relogin INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (owner_sub, address)
+);
 """
+
+MAX_EXTRA_MAILBOXES = 10
 
 
 def load_or_create_master_key(path: Path) -> bytes:
@@ -79,6 +93,17 @@ def hash_token(token: str) -> str:
 @dataclass(frozen=True)
 class StoredUser:
     sub: str
+    email: str
+    username: str
+    needs_relogin: bool
+
+
+@dataclass(frozen=True)
+class StoredMailbox:
+    """An additional mailbox, with its own login, that a signed-in person has added."""
+
+    owner_sub: str
+    address: str
     email: str
     username: str
     needs_relogin: bool
@@ -153,10 +178,85 @@ class Store:
                 "UPDATE users SET needs_relogin=1, updated_at=? WHERE sub=?", (time.time(), sub)
             )
 
+    def check_password(self, sub: str, password: str) -> bool:
+        """Constant-time comparison with the stored password; no call to Exchange."""
+        stored = self.get_password(sub)
+        if stored is None or not password:
+            return False
+        return hmac.compare_digest(stored.encode(), password.encode())
+
     def delete_user(self, sub: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM users WHERE sub=?", (sub,))
             self._conn.execute("DELETE FROM tokens WHERE sub=?", (sub,))
+            self._conn.execute("DELETE FROM extra_mailboxes WHERE owner_sub=?", (sub,))
+
+    # -- additional mailboxes ------------------------------------------------
+
+    def save_mailbox(self, owner_sub: str, email: str, username: str, password: str) -> StoredMailbox:
+        address = self.sub_for_email(email)
+        now = time.time()
+        enc = self._fernet.encrypt(password.encode())
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM extra_mailboxes WHERE owner_sub=? AND address=?", (owner_sub, address)
+            ).fetchone()
+            if not exists:
+                (count,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM extra_mailboxes WHERE owner_sub=?", (owner_sub,)
+                ).fetchone()
+                if count >= MAX_EXTRA_MAILBOXES:
+                    raise ValueError(f"At most {MAX_EXTRA_MAILBOXES} additional mailboxes per person")
+            self._conn.execute(
+                """INSERT INTO extra_mailboxes(owner_sub, address, email, username, enc_password, needs_relogin, created_at, updated_at)
+                   VALUES(?,?,?,?,?,0,?,?)
+                   ON CONFLICT(owner_sub, address) DO UPDATE SET email=excluded.email, username=excluded.username,
+                       enc_password=excluded.enc_password, needs_relogin=0, updated_at=excluded.updated_at""",
+                (owner_sub, address, email.strip(), username, enc, now, now),
+            )
+        return StoredMailbox(owner_sub, address, email.strip(), username, False)
+
+    def list_mailboxes(self, owner_sub: str) -> list[StoredMailbox]:
+        rows = self._conn.execute(
+            "SELECT owner_sub, address, email, username, needs_relogin FROM extra_mailboxes WHERE owner_sub=? ORDER BY address",
+            (owner_sub,),
+        ).fetchall()
+        return [StoredMailbox(r[0], r[1], r[2], r[3], bool(r[4])) for r in rows]
+
+    def get_mailbox(self, owner_sub: str, address: str) -> StoredMailbox | None:
+        row = self._conn.execute(
+            "SELECT owner_sub, address, email, username, needs_relogin FROM extra_mailboxes WHERE owner_sub=? AND address=?",
+            (owner_sub, self.sub_for_email(address)),
+        ).fetchone()
+        return StoredMailbox(row[0], row[1], row[2], row[3], bool(row[4])) if row else None
+
+    def get_mailbox_password(self, owner_sub: str, address: str) -> str | None:
+        """Decrypt an additional mailbox's password. Only `ews_mcp.accounts` calls this."""
+        row = self._conn.execute(
+            "SELECT enc_password FROM extra_mailboxes WHERE owner_sub=? AND address=?",
+            (owner_sub, self.sub_for_email(address)),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return self._fernet.decrypt(bytes(row[0])).decode()
+        except InvalidToken:
+            return None
+
+    def mark_mailbox_needs_relogin(self, owner_sub: str, address: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE extra_mailboxes SET needs_relogin=1, updated_at=? WHERE owner_sub=? AND address=?",
+                (time.time(), owner_sub, self.sub_for_email(address)),
+            )
+
+    def delete_mailbox(self, owner_sub: str, address: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM extra_mailboxes WHERE owner_sub=? AND address=?",
+                (owner_sub, self.sub_for_email(address)),
+            )
+        return cur.rowcount > 0
 
     # -- OAuth clients -------------------------------------------------------
 

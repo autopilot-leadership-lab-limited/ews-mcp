@@ -88,3 +88,40 @@ def test_delete_user_removes_tokens(tmp_path: Path) -> None:
     store.delete_user("p@example.com")
     assert store.get_user("p@example.com") is None
     assert store.get_token("t", "refresh") is None
+
+
+def test_additional_mailboxes(tmp_path: Path) -> None:
+    import pytest
+
+    from ews_mcp.store import MAX_EXTRA_MAILBOXES
+
+    store = make_store(tmp_path)
+    store.save_user("p@example.com", "p", "main-pass")
+    assert store.check_password("p@example.com", "main-pass") is True
+    assert store.check_password("p@example.com", "nope") is False
+    assert store.check_password("other@example.com", "main-pass") is False
+
+    store.save_mailbox("p@example.com", "Info@Example.com", "Info@Example.com", "box-pass")
+    raw = (
+        sqlite3.connect(tmp_path / "db.sqlite3")
+        .execute("SELECT enc_password FROM extra_mailboxes")
+        .fetchone()[0]
+    )
+    assert b"box-pass" not in bytes(raw)
+    assert store.get_mailbox_password("p@example.com", "info@example.com") == "box-pass"
+    assert store.get_mailbox_password("someone-else@example.com", "info@example.com") is None
+    store.mark_mailbox_needs_relogin("p@example.com", "INFO@example.com")
+    assert store.get_mailbox("p@example.com", "info@example.com").needs_relogin is True
+    store.save_mailbox("p@example.com", "info@example.com", "info@example.com", "new-pass")
+    assert store.get_mailbox("p@example.com", "info@example.com").needs_relogin is False
+    assert [m.address for m in store.list_mailboxes("p@example.com")] == ["info@example.com"]
+
+    for i in range(1, MAX_EXTRA_MAILBOXES):
+        store.save_mailbox("p@example.com", f"b{i}@example.com", f"b{i}@example.com", "x")
+    with pytest.raises(ValueError):
+        store.save_mailbox("p@example.com", "one-too-many@example.com", "x", "x")
+
+    assert store.delete_mailbox("p@example.com", "info@example.com") is True
+    assert store.delete_mailbox("p@example.com", "info@example.com") is False
+    store.delete_user("p@example.com")
+    assert store.list_mailboxes("p@example.com") == []

@@ -72,6 +72,7 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         self._accounts = accounts
         self._base = base_url.rstrip("/")
         self._limiter = RateLimiter()
+        self._page_limiter = RateLimiter(limit=10)  # /mailboxes: password check is local, allow a few more
 
     # -- clients -------------------------------------------------------------
 
@@ -244,6 +245,82 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             return result
         return HTMLResponse(_page("Password updated. Your AI app will work again on its next request."))
 
+    # -- additional mailboxes page ------------------------------------------
+
+    async def mailboxes_get(self, request: Request) -> Response:
+        return HTMLResponse(_mailboxes_form())
+
+    async def mailboxes_post(self, request: Request) -> Response:
+        """Add, update or remove an additional mailbox.
+
+        The person proves who they are with their main login, which is compared with the
+        stored password (no call to Exchange, so a typo cannot lock the directory account).
+        The additional mailbox's own password is verified against Exchange once before storing.
+        """
+        form = await request.form()
+        owner_email = str(form.get("owner_email", "")).strip()
+        owner_password = str(form.get("owner_password", ""))
+        action = str(form.get("action", "add"))
+        email = str(form.get("email", "")).strip()
+        username = str(form.get("username", "")).strip() or email
+        password = str(form.get("password", ""))
+        ip = request.client.host if request.client else "?"
+        if not owner_email or not owner_password or not email:
+            return HTMLResponse(
+                _page("Your main e-mail, its password and the mailbox address are required.", back=True), 400
+            )
+        if not self._page_limiter.allow(f"ip:{ip}") or not self._page_limiter.allow(
+            f"owner:{owner_email.lower()}"
+        ):
+            log.warning("mailboxes page rate limit hit for ip=%s", ip)
+            return HTMLResponse(_page("Too many attempts. Wait 15 minutes and try again."), 429)
+        owner_sub = self._store.sub_for_email(owner_email)
+        owner = self._store.get_user(owner_sub)
+        if owner is None or not self._store.check_password(owner_sub, owner_password):
+            log.info("mailboxes page: main login not matched for ip=%s", ip)
+            return HTMLResponse(
+                _page(
+                    "That main e-mail and password do not match a connected account. "
+                    "If you changed your password, update it at /relogin first.",
+                    back=True,
+                ),
+                401,
+            )
+        if action == "remove":
+            removed = self._accounts.remove_mailbox(owner_sub, email)
+            log.info("additional mailbox %s for sub=%s", "removed" if removed else "not found", owner_sub)
+            msg = (
+                "Mailbox removed and its stored password deleted."
+                if removed
+                else "That mailbox was not connected."
+            )
+            return HTMLResponse(_page(msg))
+        if not password:
+            return HTMLResponse(_page("The mailbox password is required.", back=True), 400)
+        if not self._limiter.allow(f"email:{email.lower()}"):
+            return HTMLResponse(_page("Too many attempts. Wait 15 minutes and try again."), 429)
+        try:
+            await anyio.to_thread.run_sync(self._accounts.add_mailbox, owner_sub, email, username, password)
+        except AuthFailed:
+            log.info("additional mailbox rejected by Exchange for sub=%s", owner_sub)
+            return HTMLResponse(
+                _page(
+                    "Exchange did not accept that mailbox login. Check the username and password.", back=True
+                ),
+                401,
+            )
+        except BackendUnavailable as exc:
+            log.warning("mailboxes page could not reach Exchange: %s", exc)
+            return HTMLResponse(
+                _page("The mail server could not be reached. Try again in a few minutes."), 502
+            )
+        except ValueError as exc:
+            return HTMLResponse(_page(str(exc), back=True), 400)
+        log.info("additional mailbox saved for sub=%s", owner_sub)
+        return HTMLResponse(
+            _page("Mailbox connected. Your AI can now read it; ask it to list your mailboxes.")
+        )
+
     async def _try_login(self, request: Request, form: Any) -> str | Response:
         email = str(form.get("email", "")).strip()
         username = str(form.get("username", "")).strip() or email
@@ -274,7 +351,7 @@ class ExchangeLoginProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
 
 _STYLE = """
 body{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;color:#222}
-label{display:block;margin:1rem 0 .25rem}input{width:100%;padding:.5rem;font-size:1rem;box-sizing:border-box}
+label{display:block;margin:1rem 0 .25rem}input,select{width:100%;padding:.5rem;font-size:1rem;box-sizing:border-box}
 button{margin-top:1.25rem;padding:.6rem 1.2rem;font-size:1rem}small{color:#666}
 .note{background:#f6f6f6;padding:.75rem;border-radius:.4rem;margin-top:1.5rem;font-size:.9rem}
 """
@@ -303,4 +380,31 @@ stored encrypted on this connector so your AI can read your mailbox. 用公司 E
 </form>
 <div class=note>This connector is <b>read-only</b>: it can list, search and read mail, and nothing else. It cannot
 send, delete, move or mark mail. 此連接器只能讀取，不能寄出、刪除、移動或標記郵件。</div>
+"""
+
+
+def _mailboxes_form() -> str:
+    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Additional mailboxes</title><style>{_STYLE}</style>
+<h1>Additional mailboxes 其他信箱</h1>
+<p>Connect another <b>company Exchange</b> mailbox that has its own login, such as a department mailbox, so your
+AI can read it too. Adding it again with a new password updates it. 連接另一個有獨立密碼的公司信箱（例如部門公用信箱）；
+用新密碼再加一次即可更新。</p>
+<form method=post action="/mailboxes" autocomplete=off>
+<label for=owner_email>Your main work e-mail 你的主信箱</label>
+<input id=owner_email name=owner_email type=email required autocomplete=username inputmode=email>
+<label for=owner_password>Its password 主信箱密碼</label>
+<input id=owner_password name=owner_password type=password required autocomplete=current-password>
+<label for=action>Action 動作</label>
+<select id=action name=action><option value=add>Add or update 新增／更新</option><option value=remove>Remove 移除</option></select>
+<label for=email>Mailbox e-mail 信箱地址</label>
+<input id=email name=email type=email required inputmode=email>
+<label for=username>Login name, if different 登入名稱（如與電郵不同）</label>
+<input id=username name=username type=text placeholder="leave blank 留空">
+<label for=password>Mailbox password (not needed to remove) 信箱密碼（移除時不用填）</label>
+<input id=password name=password type=password autocomplete=new-password>
+<button type=submit>Save 儲存</button>
+</form>
+<div class=note>Read-only, like your main mailbox. Each password is checked once against the mail server and stored
+encrypted. If one stops working, only that mailbox stops; enter it again here. 只能讀取；密碼經伺服器驗證後加密儲存。</div>
 """

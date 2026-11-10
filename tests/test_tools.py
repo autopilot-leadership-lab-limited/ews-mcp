@@ -1,11 +1,11 @@
-"""The four tools, exercised through a real in-memory MCP client against the fake backend."""
+"""The five tools, exercised through a real in-memory MCP client against the fake backend."""
 
 from __future__ import annotations
 
 import pytest
 from mcp import Client
 
-from ews_mcp.accounts import SingleAccount
+from ews_mcp.accounts import LocalAccounts, SingleAccount
 from ews_mcp.tools import build_server
 
 from .fake_backend import FakeBackend
@@ -18,12 +18,12 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-async def test_tools_are_read_only_and_exactly_four() -> None:
+async def test_tools_are_read_only_and_exactly_five() -> None:
     mcp = build_server(SingleAccount(FakeBackend()))
     async with Client(mcp) as client:
         tools = (await client.list_tools()).tools
     names = sorted(t.name for t in tools)
-    assert names == ["get_message", "get_thread", "list_folders", "search_messages"]
+    assert names == ["get_message", "get_thread", "list_folders", "list_mailboxes", "search_messages"]
     for t in tools:
         assert t.annotations is not None and t.annotations.read_only_hint is True
         assert t.annotations.destructive_hint is False
@@ -110,3 +110,41 @@ async def test_instructions_state_confidentiality() -> None:
     text = mcp.instructions or ""
     assert "CONFIDENTIAL" in text and "cannot send" in text
     assert init is None or init.name == "exchange-mail"
+
+
+async def test_mailbox_argument_picks_the_backend() -> None:
+    main, dept = FakeBackend(), FakeBackend()
+    accounts = LocalAccounts(main, primary_address="pilot@example.com", extras={"Info@Example.com": dept})
+    mcp = build_server(accounts)
+    async with Client(mcp) as client:
+        boxes = await client.call_tool("list_mailboxes", {})
+        await client.call_tool("list_folders", {})
+        r = await client.call_tool("search_messages", {"folder": "sent", "mailbox": "info@example.com"})
+        await client.call_tool("get_message", {"message_id": "m1", "mailbox": "INFO@example.com"})
+        await client.call_tool("list_folders", {"mailbox": "pilot@example.com"})
+        unknown = await client.call_tool("list_folders", {"mailbox": "nobody@example.com"})
+    assert boxes.structured_content["mailboxes"] == [
+        {"address": "pilot@example.com", "primary": True, "needs_password": False},
+        {"address": "Info@Example.com", "primary": False, "needs_password": False},
+    ]
+    assert r.structured_content["mailbox"] == "info@example.com"
+    assert main.calls == ["list_folders", "list_folders"]
+    assert dept.calls == ["search:sent", "get:m1"]
+    assert unknown.is_error and "Available: pilot@example.com, Info@Example.com" in unknown.content[0].text
+
+
+async def test_auth_failure_on_one_mailbox_leaves_the_others_working() -> None:
+    main, dept = FakeBackend(), FakeBackend(fail_auth=True)
+    mcp = build_server(
+        LocalAccounts(main, primary_address="pilot@example.com", extras={"info@example.com": dept})
+    )
+    async with Client(mcp) as client:
+        first = await client.call_tool("list_folders", {"mailbox": "info@example.com"})
+        second = await client.call_tool("list_folders", {"mailbox": "info@example.com"})
+        ok = await client.call_tool("list_folders", {})
+        boxes = await client.call_tool("list_mailboxes", {})
+    assert first.is_error and "info@example.com" in first.content[0].text
+    assert second.is_error and "Other mailboxes still work" in second.content[0].text
+    assert not ok.is_error
+    assert dept.calls == ["list_folders"]  # never retried
+    assert [m["needs_password"] for m in boxes.structured_content["mailboxes"]] == [False, True]

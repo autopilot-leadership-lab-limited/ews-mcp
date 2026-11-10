@@ -44,6 +44,49 @@ def _local_credentials(args: argparse.Namespace):
     return EwsCredentials(email=email, username=username, password=password)
 
 
+def _extra_addresses(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "mailboxes", None) or os.environ.get("EWS_MCP_EXTRA_MAILBOXES", "")
+    seen: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        addr = part.strip()
+        if addr and addr.lower() not in (s.lower() for s in seen):
+            seen.append(addr)
+    return seen
+
+
+def _extra_credentials(args: argparse.Namespace, primary_email: str):
+    """Credentials for EWS_MCP_EXTRA_MAILBOXES: one address each, password from the OS keyring."""
+    from .ews import EwsCredentials
+
+    out = []
+    for addr in _extra_addresses(args):
+        if addr.lower() == primary_email.lower():
+            continue
+        try:
+            import keyring  # type: ignore
+
+            stored = keyring.get_password(KEYRING_SERVICE, addr)
+        except ImportError:
+            stored = None
+        if stored is None:
+            sys.exit(f"No password for {addr}: run `ews-mcp set-password --email {addr}`")
+        if not stored:
+            sys.exit(f"The stored password for {addr} is empty: run `ews-mcp set-password --email {addr}`")
+        password = stored
+        out.append(EwsCredentials(email=addr, username=addr, password=password))
+    return out
+
+
+def _local_accounts(args: argparse.Namespace):
+    from .accounts import LocalAccounts
+    from .ews import EwsBackend
+
+    settings = _local_settings(args)
+    primary = _local_credentials(args)
+    extras = {c.email: EwsBackend(settings, c) for c in _extra_credentials(args, primary.email)}
+    return LocalAccounts(EwsBackend(settings, primary), primary_address=primary.email, extras=extras)
+
+
 def _local_settings(args: argparse.Namespace):
     from .ews import EwsSettings
 
@@ -71,22 +114,27 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_stdio(args: argparse.Namespace) -> None:
-    from .accounts import SingleAccount
-    from .ews import EwsBackend
     from .tools import build_server
 
-    backend = EwsBackend(_local_settings(args), _local_credentials(args))
-    mcp = build_server(SingleAccount(backend))
+    mcp = build_server(_local_accounts(args))
     mcp.run(transport="stdio")
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    from .ews import EwsBackend
+    from .backend import AuthFailed
 
-    backend = EwsBackend(_local_settings(args), _local_credentials(args))
-    address = backend.verify()
-    folders = backend.list_folders()
-    print(f"OK: signed in as {address}; {len(folders)} mail folders visible")
+    accounts = _local_accounts(args)
+    for box in accounts.mailboxes("local"):
+        backend = accounts.backend_for("local", None if box.primary else box.address)
+        try:
+            address = backend.verify()
+        except AuthFailed:
+            # Stop at the first rejected login: no further attempts, so no account lockout.
+            sys.exit(
+                f"FAILED: {box.address} rejected the login. Fix it with `ews-mcp set-password --email {box.address}`"
+            )
+        folders = backend.list_folders()
+        print(f"OK: {address}{' (primary)' if box.primary else ''}; {len(folders)} mail folders visible")
 
 
 def cmd_set_password(args: argparse.Namespace) -> None:
@@ -96,6 +144,10 @@ def cmd_set_password(args: argparse.Namespace) -> None:
         sys.exit("Install the keyring extra: pip install 'ews-mcp[keyring]'")
     email = args.email or os.environ.get("EWS_MCP_EMAIL", "").strip() or input("Work e-mail: ").strip()
     password = getpass.getpass(f"Exchange password for {email}: ")
+    if not password:
+        sys.exit("Empty password: nothing stored. Type (or Ctrl+V) the password, then press Enter.")
+    if getpass.getpass("Again, to confirm: ") != password:
+        sys.exit("The two entries differ: nothing stored.")
     keyring.set_password(KEYRING_SERVICE, email, password)
     print("Stored in the system keyring.")
 
@@ -117,6 +169,9 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--exchange-host")
         q.add_argument("--email")
         q.add_argument("--username")
+        q.add_argument(
+            "--mailboxes", help="additional mailbox addresses, comma separated (or EWS_MCP_EXTRA_MAILBOXES)"
+        )
         q.set_defaults(fn=fn)
 
     k = sub.add_parser("set-password", help="store the Exchange password in the OS keyring (local mode)")

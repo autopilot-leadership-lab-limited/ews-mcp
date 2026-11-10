@@ -6,7 +6,8 @@ Services). It is vendor-neutral: any MCP client works (Claude, ChatGPT, Cursor, 
 CLI, …), on desktop, web or mobile.
 
 **What it can do:** list folders, search mail (Inbox, Sent Items or any folder), read one message,
-read a whole conversation.
+read a whole conversation, in the person's own mailbox and in any additional mailboxes they connect
+with those mailboxes' own logins (for example department mailboxes).
 
 **What it cannot do, by design:** send, reply, forward, delete, move, flag or mark mail as read,
 change rules or settings, open attachments. There is no code path for any of these. A later phase
@@ -59,7 +60,8 @@ ews-mcp serve
 
 Endpoints: `/mcp` (MCP, bearer-protected), `/.well-known/oauth-authorization-server`,
 `/authorize`, `/token`, `/register`, `/revoke` (OAuth), `/login` (sign-in page the OAuth flow
-sends people to), `/relogin` (update a changed password), `/health`.
+sends people to), `/relogin` (update a changed password), `/mailboxes` (add, update or remove
+additional mailboxes), `/health`.
 
 ### Connect an AI client
 
@@ -70,6 +72,17 @@ Access tokens last 1 hour and refresh silently for 30 days; after that the perso
 
 If the person changes their Exchange password, the connector stops at the first failed login (it
 never retries, so it cannot lock the directory account) and the AI tells them to visit `/relogin`.
+
+### Additional mailboxes
+
+A signed-in person can connect more mailboxes that have their own Exchange login (department or
+shared mailboxes with a separate password), up to 10, at `/mailboxes`. The page asks for their
+main e-mail and password, compared with the stored one (no call to Exchange), then the other
+mailbox's address and password, which is verified against Exchange once and stored encrypted like
+the main one. Adding the same address again replaces its password; "Remove" deletes it.
+
+Tools take an optional `mailbox` argument (an address from `list_mailboxes`; empty = the main
+mailbox). If one mailbox's password stops working, only that mailbox stops; the others keep working.
 
 ### Adding a second person
 
@@ -105,6 +118,11 @@ ews-mcp check
 
 `$env:` settings last for that window only; the AI client config below sets them per launch.
 
+**Additional mailboxes (local):** list their addresses in `EWS_MCP_EXTRA_MAILBOXES`, comma
+separated, and store each password once with `ews-mcp set-password --email <address>`. They sign
+in with the address as login name. `ews-mcp check` then tests every mailbox and stops at the first
+rejected login.
+
 Then register `ews-mcp stdio` in the AI app. Generic MCP config (Claude Desktop, Cursor, VS Code,
 Gemini CLI and most others accept this shape):
 
@@ -116,7 +134,8 @@ Gemini CLI and most others accept this shape):
       "args": ["stdio"],
       "env": {
         "EWS_MCP_EXCHANGE_HOST": "mail.example.com",
-        "EWS_MCP_EMAIL": "you@example.com"
+        "EWS_MCP_EMAIL": "you@example.com",
+        "EWS_MCP_EXTRA_MAILBOXES": "info@example.com, sales@example.com"
       }
     }
   }
@@ -127,12 +146,14 @@ Gemini CLI and most others accept this shape):
 
 | Tool | Does |
 |---|---|
+| `list_mailboxes` | The person's connected mailboxes, which one is primary, and which need a new password |
 | `list_folders` | Folder paths with total and unread counts |
 | `search_messages` | Headers from one folder, newest first; filters: text, sender, recipient, subject, since/until, has_attachments, unread_only; pages of ≤ 50 |
 | `get_message` | One message: headers, plain-text body (truncated at a limit), attachment names |
 | `get_thread` | A conversation across Inbox and Sent Items, oldest first |
 
-Every tool is annotated read-only. The server's instructions tell the AI that mail is
+Every tool except `list_mailboxes` takes an optional `mailbox` (empty = primary). Message and
+conversation ids belong to the mailbox they came from. Every tool is annotated read-only. The server's instructions tell the AI that mail is
 confidential, must not go into long-term memory, and is data rather than instructions.
 
 ## Development
@@ -154,9 +175,9 @@ src/ews_mcp/
   backend.py   MailBackend interface and data models (read-only by construction)
   ews.py       EWS implementation (exchangelib); only FindFolder/GetFolder/FindItem/GetItem
   store.py     SQLite: encrypted logins, OAuth clients, codes, hashed tokens
-  accounts.py  Person -> backend; stops on the first auth failure
+  accounts.py  Person + mailbox -> backend; stops on the first auth failure, per mailbox
   oauth.py     OAuth 2.1 authorization server + sign-in pages
-  tools.py     The MCP server and its four tools
+  tools.py     The MCP server and its five tools
   app.py       Hosted app assembly from environment
   cli.py       serve / stdio / check / set-password
 ```
